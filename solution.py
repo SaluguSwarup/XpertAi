@@ -164,6 +164,40 @@ def _natural_sort_key(identifier):
     return [int(part) if part.isdigit() else part for part in re.split(r"(\d+)", str(identifier))]
 
 
+def identify_eligible_participants(chats, messages, messages_by_chat_id=None):
+    """
+    Identify participants who genuinely appear in conversation data.
+    Requires both non-ME membership in chats.jsonl and presence in active
+    conversation data (sending a message in messages.jsonl or participating in a
+    chat that has recorded messages). Seed-only or zero-message entries are excluded.
+    """
+    chat_person_ids = {p for c in chats for p in c.get("participants", [])} - {"ME"}
+    valid_chat_ids = {c["chat_id"] for c in chats if "chat_id" in c}
+    if messages_by_chat_id is None:
+        active_chat_ids = {
+            m["chat_id"] for m in messages
+            if m.get("chat_id") in valid_chat_ids
+        }
+    else:
+        active_chat_ids = {
+            cid for cid in valid_chat_ids
+            if messages_by_chat_id.get(cid)
+        }
+    sender_ids = {
+        m.get("sender_id") for m in messages
+        if m.get("sender_id") and m.get("sender_id") != "ME"
+    }
+    active_chat_person_ids = {
+        p
+        for c in chats
+        if c.get("chat_id") in active_chat_ids
+        for p in c.get("participants", [])
+        if p != "ME"
+    }
+    eligible = chat_person_ids & (sender_ids | active_chat_person_ids)
+    return sorted(eligible, key=_natural_sort_key)
+
+
 def _compute_dataset_hash(input_dir):
     """Compute a path-independent SHA-256 fingerprint of dataset input files."""
     h = hashlib.sha256()
@@ -304,17 +338,43 @@ def extract_and_consolidate(input_dir=None, output_path=None, participant=None,
     valid_chat_ids = {c["chat_id"] for c in chats}
     valid_person_ids = {p for c in chats for p in c.get("participants", [])} - {"ME"}
     valid_msg_ids = {m["id"] for m in messages}
+    eligible_pids = identify_eligible_participants(chats, messages, messages_by_chat_id)
+    eligible_set = set(eligible_pids)
+    active_chat_ids = {cid for cid in valid_chat_ids if messages_by_chat_id.get(cid)}
     seeded_circles = seed.get("circles", {}) if isinstance(seed, dict) else {}
 
-    # Target participants in deterministic order
-    if participant:
-        if participant not in valid_person_ids:
-            print(f"[WARNING] Participant '{participant}' not found in chats. Known: {sorted(valid_person_ids, key=_natural_sort_key)[:5]}...")
+    # Target participants in deterministic order strictly from conversation-eligible IDs
+    if participant is not None:
+        participant = participant.strip()
+        if not participant or participant == "ME" or participant not in eligible_set:
+            raise ValueError(
+                f"Participant '{participant}' is not an eligible participant in conversation data "
+                f"(known eligible count: {len(eligible_pids)})."
+            )
         target_pids = [participant]
     else:
-        ordered_pids = sorted(valid_person_ids, key=_natural_sort_key)
-        target_pids = ordered_pids[:limit] if limit is not None else ordered_pids
+        target_pids = eligible_pids[:limit] if limit is not None else eligible_pids
 
+    if not target_pids:
+        raise ValueError("No eligible participants found in the conversation dataset.")
+
+    target_set = set(target_pids)
+    is_filtered_run = bool(participant is not None or limit is not None)
+    if is_filtered_run:
+        relevant_chats = [
+            c for c in chats
+            if c["chat_id"] in active_chat_ids and (target_set & set(c.get("participants", [])))
+        ]
+    else:
+        relevant_chats = list(chats)
+    relevant_chat_ids = {c["chat_id"] for c in relevant_chats}
+    relevant_msg_ids = {
+        m["id"]
+        for cid in relevant_chat_ids
+        for m in messages_by_chat_id.get(cid, [])
+    }
+
+    print(f"Eligible participants in conversation data: {len(eligible_pids)}")
     print(f"Target participants to extract: {len(target_pids)} ({target_pids[:10]}{'...' if len(target_pids) > 10 else ''})")
 
     has_api_key = bool((os.environ.get("LLM_API_KEY") or "").strip())
@@ -423,21 +483,24 @@ def extract_and_consolidate(input_dir=None, output_path=None, participant=None,
                     )
                 raise RuntimeError(f"Batch {b_idx} ({batch_pids}) extraction failed: {e}") from e
 
-    # Aggregate extracted items strictly for verified target_pids
+    # Aggregate extracted items strictly for verified target_pids and relevant chats/messages
     for pid in target_pids:
         res = completed_extractions.get(pid)
         if not res or res.get("error") or res.get("is_fallback"):
             continue
         vd = res.get("val_data", {})
-        if res.get("circle"):
-            extracted_people[pid] = {"id": pid, "circle": res["circle"]}
         for p in vd.get("people", []):
-            if p["id"] not in extracted_people:
-                extracted_people[p["id"]] = p
+            if p.get("id") == pid and p.get("circle"):
+                extracted_people.setdefault(pid, dict(p))
+        if res.get("circle") and pid not in extracted_people:
+            extracted_people[pid] = {"id": pid, "circle": res["circle"]}
         for o in vd.get("organisations", []):
-            extracted_orgs[o["id"]] = o
+            if o.get("id"):
+                extracted_orgs[o["id"]] = o
         for c in vd.get("chats", []):
-            extracted_chats[c["chat_id"]] = c
+            cid = c.get("chat_id")
+            if cid in relevant_chat_ids:
+                extracted_chats[cid] = c
         for g in vd.get("goals", []):
             extracted_goals.append(g)
         for l in vd.get("open_loops", []):
@@ -446,76 +509,138 @@ def extract_and_consolidate(input_dir=None, output_path=None, participant=None,
     # -------------------------------------------------------------
     # Cross-chat Open-loop & Schema Consolidation
     # -------------------------------------------------------------
-    # 1. People: Seed circles take absolute precedence
-    final_people = []
-    for pid in sorted(valid_person_ids, key=_natural_sort_key):
-        if pid in seeded_circles:
-            circle = seeded_circles[pid]
-        elif pid in extracted_people and extracted_people[pid].get("circle"):
-            circle = extracted_people[pid]["circle"]
-        else:
-            circle = "friend"  # Schema-valid baseline fallback
-        final_people.append({"id": pid, "circle": circle})
+    # 1. People: Include only eligible target participants who were actually extracted.
+    #    Seed circles override circle only for extracted participants; never fabricate defaults.
+    represented_people = []
+    for pid in target_pids:
+        if pid not in extracted_people:
+            continue
+        raw_person = extracted_people[pid]
+        circle = seeded_circles[pid] if pid in seeded_circles else raw_person.get("circle")
+        if not circle:
+            continue
+        person_entry = {"id": pid, "circle": circle}
+        if raw_person.get("links"):
+            person_entry["links"] = list(raw_person["links"])
+        if raw_person.get("looks_after"):
+            person_entry["looks_after"] = list(raw_person["looks_after"])
+        represented_people.append(person_entry)
 
-    # 2. Organisations: Ensure every group chat has an organisation
-    final_orgs = list(extracted_orgs.values())
-    org_ids = {o["id"] for o in final_orgs}
+    represented_person_ids = {p["id"] for p in represented_people}
+
+    # 2. Chats & Organisations: Scope strictly to relevant_chats
+    org_by_id = dict(extracted_orgs)
+    org_ids = set(org_by_id.keys())
     final_chats = []
-    tied_chats = set()
+    used_default_org_ids = set()
 
-    for c in chats:
-        cid = c["chat_id"]
-        # Use LLM tie if available and valid
-        if cid in extracted_chats:
-            tie = extracted_chats[cid]
-            if "organisation" in tie and tie["organisation"] in org_ids:
-                final_chats.append(tie)
-                tied_chats.add(cid)
-                continue
-            elif "person" in tie and tie["person"] in valid_person_ids:
-                final_chats.append(tie)
-                tied_chats.add(cid)
-                continue
+    should_emit_chats = (not is_filtered_run) or bool(represented_people or completed_extractions)
+    allowed_tie_person_ids = (
+        represented_person_ids if is_filtered_run else (represented_person_ids or valid_person_ids)
+    )
 
-        # Default tie policy: 1:1 -> person, Group -> organisation
-        if c["is_group"]:
-            default_org = "org_" + cid
-            if default_org not in org_ids:
-                final_orgs.append({
-                    "id": default_org,
-                    "name": c["name"],
-                    "type": "other",
-                    "side": "work",
-                    "role": "member"
-                })
-                org_ids.add(default_org)
-            final_chats.append({"chat_id": cid, "organisation": default_org})
-        else:
-            other = next((p for p in c.get("participants", []) if p != "ME"), None)
-            if other and other in valid_person_ids:
-                final_chats.append({"chat_id": cid, "person": other})
+    if should_emit_chats:
+        for c in relevant_chats:
+            cid = c["chat_id"]
+            if cid in extracted_chats:
+                tie = extracted_chats[cid]
+                if "organisation" in tie and tie["organisation"] in org_ids:
+                    final_chats.append({"chat_id": cid, "organisation": tie["organisation"]})
+                    continue
+                if "person" in tie and tie["person"] in allowed_tie_person_ids:
+                    final_chats.append({"chat_id": cid, "person": tie["person"]})
+                    continue
+
+            if c.get("is_group"):
+                default_org = "org_" + cid
+                if default_org not in org_by_id:
+                    org_by_id[default_org] = {
+                        "id": default_org,
+                        "name": c["name"],
+                        "type": "other",
+                        "side": "work",
+                        "role": "member",
+                    }
+                    org_ids.add(default_org)
+                used_default_org_ids.add(default_org)
+                final_chats.append({"chat_id": cid, "organisation": default_org})
             else:
-                fallback_person = sorted(valid_person_ids, key=_natural_sort_key)[0]
-                final_chats.append({"chat_id": cid, "person": fallback_person})
-        tied_chats.add(cid)
+                other = next(
+                    (p for p in c.get("participants", []) if p != "ME" and p in allowed_tie_person_ids),
+                    None,
+                )
+                if other is None and not is_filtered_run:
+                    other = next(
+                        (p for p in c.get("participants", []) if p != "ME" and p in valid_person_ids),
+                        None,
+                    )
+                if other is not None:
+                    final_chats.append({"chat_id": cid, "person": other})
+                elif not is_filtered_run and allowed_tie_person_ids:
+                    fallback_person = sorted(allowed_tie_person_ids, key=_natural_sort_key)[0]
+                    final_chats.append({"chat_id": cid, "person": fallback_person})
 
-    # 3. Goals: Deduplicate and cap at 10
+    # Preserve valid cross-entity links / looks_after references on kept people
+    final_people = []
+    for p in represented_people:
+        clean_p = {"id": p["id"], "circle": p["circle"]}
+        valid_links = [
+            {"organisation": lnk["organisation"], "link": lnk["link"]}
+            for lnk in p.get("links", [])
+            if isinstance(lnk, dict)
+            and lnk.get("organisation") in org_ids
+            and lnk.get("link") in ("runs", "supports")
+        ]
+        if valid_links:
+            clean_p["links"] = valid_links
+        valid_looks = [
+            other for other in p.get("looks_after", [])
+            if other in represented_person_ids and other != p["id"]
+        ]
+        if valid_looks:
+            clean_p["looks_after"] = valid_looks
+        final_people.append(clean_p)
+
+    referenced_org_ids = (
+        {c["organisation"] for c in final_chats if "organisation" in c}
+        | {lnk["organisation"] for p in final_people for lnk in p.get("links", [])}
+    )
+    if is_filtered_run:
+        kept_org_ids = referenced_org_ids
+    else:
+        kept_org_ids = set(extracted_orgs.keys()) | used_default_org_ids | referenced_org_ids
+    final_orgs = [org for oid, org in org_by_id.items() if oid in kept_org_ids]
+
+    # 3. Goals: Scope evidence to relevant messages, deduplicate, and cap at 10
     final_goals = []
     seen_goal_titles = set()
     for g in extracted_goals:
         title = g.get("title", "").strip().lower()
-        if title and title not in seen_goal_titles:
+        ev = list(dict.fromkeys(mid for mid in (g.get("evidence") or []) if mid in relevant_msg_ids))
+        if title and ev and title not in seen_goal_titles:
             seen_goal_titles.add(title)
-            final_goals.append(g)
+            goal_copy = dict(g)
+            goal_copy["evidence"] = ev
+            final_goals.append(goal_copy)
             if len(final_goals) == 10:
                 break
 
-    # 4. Open Loops: Deduplicate by source_msg, enforce conservative closure
+    # 4. Open Loops: Scope to relevant chats/messages/owners and deduplicate by source_msg
+    allowed_loop_owners = (represented_person_ids | {"ME"}) if is_filtered_run else (valid_person_ids | {"ME"})
     final_loops = []
     seen_source_msgs = set()
     for l in extracted_loops:
         src = l.get("source_msg")
-        if src in valid_msg_ids and src not in seen_source_msgs:
+        cid = l.get("chat_id")
+        owner = l.get("owner")
+        closed_by = l.get("closed_by")
+        if (
+            cid in relevant_chat_ids
+            and src in relevant_msg_ids
+            and src not in seen_source_msgs
+            and owner in allowed_loop_owners
+            and (closed_by is None or closed_by in relevant_msg_ids)
+        ):
             seen_source_msgs.add(src)
             final_loops.append(l)
 

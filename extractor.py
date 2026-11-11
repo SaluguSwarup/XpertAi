@@ -153,31 +153,78 @@ def is_unambiguous_closure(cls_msg, src_msg, owner):
     return any(re.search(rf"\b{marker}\b", body) for marker in explicit_done_markers)
 
 
-def _extract_json_object(raw_text):
-    """Parse JSON from direct output, markdown code fences, or embedded JSON objects."""
-    text = (raw_text or "").strip()
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        pass
+_EXTRACTION_KEYS = {"people", "organisations", "chats", "goals", "open_loops"}
 
-    fence_match = re.search(r"```(?:json)?\s*(\{.*\})\s*```", text, re.DOTALL)
-    if fence_match:
-        try:
-            return json.loads(fence_match.group(1))
-        except json.JSONDecodeError:
-            pass
 
+def _decode_first_json_dict(text):
+    """Find valid JSON dict candidates in text, preferring schema extraction objects."""
     decoder = json.JSONDecoder()
+    fallback_dict = None
     start = text.find("{")
     while start != -1:
         try:
             obj, _ = decoder.raw_decode(text, start)
             if isinstance(obj, dict):
-                return obj
+                if _EXTRACTION_KEYS & obj.keys():
+                    return obj
+                if fallback_dict is None:
+                    fallback_dict = obj
         except json.JSONDecodeError:
             pass
         start = text.find("{", start + 1)
+    return fallback_dict
+
+
+def _extract_json_object(raw_text):
+    """Parse JSON from direct output, markdown code fences, thinking tags, or embedded JSON."""
+    if not isinstance(raw_text, str) or not raw_text.strip():
+        raise ValueError("Empty response from model; expected a JSON object.")
+
+    text = raw_text.strip()
+    try:
+        direct = json.loads(text)
+        if isinstance(direct, dict):
+            return direct
+    except json.JSONDecodeError:
+        pass
+
+    search_regions = []
+    if "</think>" in text:
+        after_think = text.rsplit("</think>", 1)[1].strip()
+        if after_think:
+            search_regions.append(after_think)
+    search_regions.append(text)
+
+    fallback = None
+    for region in search_regions:
+        for match in re.finditer(r"```(?:[a-zA-Z0-9_-]+)?\s*(.*?)\s*```", region, re.DOTALL):
+            block = match.group(1).strip()
+            if not block:
+                continue
+            try:
+                parsed = json.loads(block)
+                if isinstance(parsed, dict):
+                    if _EXTRACTION_KEYS & parsed.keys():
+                        return parsed
+                    if fallback is None:
+                        fallback = parsed
+            except json.JSONDecodeError:
+                candidate = _decode_first_json_dict(block)
+                if isinstance(candidate, dict):
+                    if _EXTRACTION_KEYS & candidate.keys():
+                        return candidate
+                    if fallback is None:
+                        fallback = candidate
+
+        candidate = _decode_first_json_dict(region)
+        if isinstance(candidate, dict):
+            if _EXTRACTION_KEYS & candidate.keys():
+                return candidate
+            if fallback is None:
+                fallback = candidate
+
+    if fallback is not None:
+        return fallback
 
     return json.loads(text)
 
@@ -197,7 +244,10 @@ def parse_and_validate_extraction(raw_text, valid_chat_ids, valid_person_ids, va
     try:
         data = _extract_json_object(raw_text)
     except json.JSONDecodeError as e:
-        return None, [f"JSONDecodeError: {e}"], []
+        snippet = (raw_text or "").strip()[:160].replace("\n", " ")
+        return None, [f"JSONDecodeError: {e} (response preview: {snippet!r})"], []
+    except ValueError as e:
+        return None, [str(e)], []
 
     errors = []
     flags = []

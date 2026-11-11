@@ -229,13 +229,24 @@ def _load_valid_checkpoint(checkpoint_path, dataset_hash, config_hash, target_pi
     if not isinstance(raw_per_p, dict):
         return {}
 
+    failed_set = set(ckpt_data.get("failed_participants") or [])
+    required_vd_keys = ("people", "organisations", "chats", "goals", "open_loops")
+
     loaded = {}
     for pid in target_pids:
+        if pid in failed_set:
+            continue
         entry = raw_per_p.get(pid)
-        if not isinstance(entry, dict) or "error" in entry:
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("error") or entry.get("is_fallback"):
+            continue
+        if entry.get("status") not in (None, "success", "completed"):
             continue
         vd = entry.get("val_data")
-        if not isinstance(vd, dict):
+        if not isinstance(vd, dict) or not all(isinstance(vd.get(k), list) for k in required_vd_keys):
+            continue
+        if entry.get("circle") is None and not any(vd.get(k) for k in required_vd_keys):
             continue
         chat_ok = all(c.get("chat_id") in valid_chat_ids for c in vd.get("chats", []) if isinstance(c, dict))
         people_ok = all(p.get("id") in valid_person_ids for p in vd.get("people", []) if isinstance(p, dict))
@@ -245,16 +256,27 @@ def _load_valid_checkpoint(checkpoint_path, dataset_hash, config_hash, target_pi
     return loaded
 
 
-def _save_checkpoint_atomic(checkpoint_path, dataset_hash, config_hash, config_obj, completed_extractions):
-    """Atomically write checkpoint data to prevent corruption on interruption."""
+def _save_checkpoint_atomic(checkpoint_path, dataset_hash, config_hash, config_obj,
+                            completed_extractions, failed_participants=None):
+    """Atomically write verified successful checkpoint entries without storing fallbacks."""
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+    clean_per_p = {
+        pid: entry
+        for pid, entry in completed_extractions.items()
+        if isinstance(entry, dict)
+        and not entry.get("error")
+        and not entry.get("is_fallback")
+        and entry.get("status", "success") in ("success", "completed")
+    }
     payload = {
         "version": 2,
         "dataset_hash": dataset_hash,
         "config_hash": config_hash,
         "config": config_obj,
-        "per_participant": completed_extractions,
+        "per_participant": clean_per_p,
     }
+    if failed_participants:
+        payload["failed_participants"] = sorted(set(failed_participants))
     tmp_path = checkpoint_path.with_name(f".{checkpoint_path.name}.{os.getpid()}.tmp")
     tmp_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
     os.replace(tmp_path, checkpoint_path)
@@ -359,20 +381,23 @@ def extract_and_consolidate(input_dir=None, output_path=None, participant=None,
                     require_explicit_closure=True
                 )
                 if val_data is None:
-                    raise ValueError(f"Extraction response was not valid JSON: {errs}")
+                    raise ValueError(f"Extraction response could not be parsed as valid JSON: {errs}")
+                if not any(val_data.get(k) for k in ("people", "organisations", "chats", "goals", "open_loops")):
+                    raise ValueError("Model returned an empty extraction JSON object with zero extracted entities.")
                 elapsed = round(time.time() - t0, 2)
                 print(f"    Success in {elapsed}s: {len(val_data.get('people', []))} people, {len(val_data.get('open_loops', []))} loops.")
 
-                # Record in completed_extractions
+                # Record strictly verified extractions in completed_extractions
                 for pid in batch_pids:
                     p_circle = next((p["circle"] for p in val_data.get("people", []) if p["id"] == pid), None)
                     completed_extractions[pid] = {
+                        "status": "success",
                         "circle": p_circle,
                         "val_data": val_data,
                         "elapsed": elapsed
                     }
 
-                # Intermediate atomic checkpoint save
+                # Intermediate atomic checkpoint save (never persists failed batches)
                 if not participant and use_checkpoint:
                     _save_checkpoint_atomic(checkpoint_path, dataset_hash, config_hash, config_obj, completed_extractions)
                     print(f"    [CHECKPOINT] Saved {checkpoint_path}")
@@ -381,22 +406,27 @@ def extract_and_consolidate(input_dir=None, output_path=None, participant=None,
                 if b_idx < len(batches):
                     time.sleep(5)
 
-            except (RuntimeError, urllib.error.URLError, TimeoutError) as e:
-                print(f"    [API ERROR] Batch {b_idx} aborted due to API/quota error ({e}).", file=sys.stderr)
-                raise
-            except ValueError as e:
-                print(f"    [FAIL] Batch {b_idx} extraction parse failed ({e}). Recording fallback for this batch.")
-                for pid in batch_pids:
-                    completed_extractions[pid] = {
-                        "circle": None,
-                        "val_data": {},
-                        "error": str(e)
-                    }
+            except (RuntimeError, urllib.error.URLError, TimeoutError, ValueError) as e:
+                print(
+                    f"    [EXTRACTION ERROR] Batch {b_idx} ({batch_pids}) failed ({e}). "
+                    f"Skipping silent fallback; {len(completed_extractions)} completed participant(s) preserved for retry.",
+                    file=sys.stderr,
+                )
+                if not participant and use_checkpoint and completed_extractions:
+                    _save_checkpoint_atomic(
+                        checkpoint_path,
+                        dataset_hash,
+                        config_hash,
+                        config_obj,
+                        completed_extractions,
+                        failed_participants=batch_pids,
+                    )
+                raise RuntimeError(f"Batch {b_idx} ({batch_pids}) extraction failed: {e}") from e
 
-    # Aggregate extracted items strictly for target_pids
+    # Aggregate extracted items strictly for verified target_pids
     for pid in target_pids:
         res = completed_extractions.get(pid)
-        if not res:
+        if not res or res.get("error") or res.get("is_fallback"):
             continue
         vd = res.get("val_data", {})
         if res.get("circle"):

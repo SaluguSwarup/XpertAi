@@ -66,6 +66,22 @@ def _should_fallback_without_json_mode(code, err_body, body):
     return not any(m in lower for m in non_format_markers)
 
 
+def _extract_message_content(msg):
+    """Extract text content from an OpenAI/OpenRouter choice message."""
+    content = msg.get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, dict) and isinstance(item.get("text"), str):
+                parts.append(item["text"])
+            elif isinstance(item, str):
+                parts.append(item)
+        return "\n".join(parts)
+    return ""
+
+
 def _build_request(endpoint_url, api_key, body):
     return urllib.request.Request(
         endpoint_url,
@@ -145,6 +161,11 @@ def chat(messages, model=None, temperature=0, max_tokens=None, response_format=N
                 continue
             raise RuntimeError(f"LLM API Error (HTTP {e.code}) at {endpoint_url}: {err_body}") from e
 
+    if not isinstance(data, dict):
+        raise RuntimeError(f"Unexpected non-object API response from {endpoint_url}: {type(data).__name__}")
+    if data.get("error"):
+        raise RuntimeError(f"LLM API returned error payload at {endpoint_url}: {data['error']}")
+
     usage = data.get("usage") or {}
     usage_path = Path(__file__).resolve().parent / "usage.jsonl"
     usage_record = {
@@ -161,4 +182,24 @@ def chat(messages, model=None, temperature=0, max_tokens=None, response_format=N
         with open(usage_path, "a", encoding="utf-8") as f:
             f.write(json.dumps(usage_record) + "\n")
 
-    return data["choices"][0]["message"]["content"]
+    choices = data.get("choices")
+    if not isinstance(choices, list) or not choices:
+        raise RuntimeError(f"LLM API response missing 'choices' at {endpoint_url}: keys={sorted(data.keys())}")
+
+    choice = choices[0] if isinstance(choices[0], dict) else {}
+    finish_reason = choice.get("finish_reason")
+    msg = choice.get("message")
+    if not isinstance(msg, dict):
+        raise RuntimeError(f"LLM API response missing 'message' object (finish_reason={finish_reason!r}).")
+
+    content = _extract_message_content(msg)
+    if not content or not content.strip():
+        has_reasoning = bool(msg.get("reasoning") or msg.get("reasoning_content") or msg.get("reasoning_details"))
+        refusal = msg.get("refusal")
+        raise RuntimeError(
+            f"Model '{body['model']}' returned empty content "
+            f"(finish_reason={finish_reason!r}, completion_tokens={usage.get('completion_tokens')}, "
+            f"has_reasoning={has_reasoning}, refusal={refusal!r})."
+        )
+
+    return content

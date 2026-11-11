@@ -1,0 +1,57 @@
+﻿# Challenge datasets and private inputs
+/data/
+/input/
+/inputs/
+*.zip
+
+# Answer keys are private, including fixture scoring keys
+**/answers/
+answer.json
+answers.json
+answer_key*.json
+*_answer_key.json
+
+# Secrets and local environment configuration
+.env
+.env.*
+!.env.example
+.envrc
+*.key
+*.pem
+*.secret
+*_secret*
+*.token
+credentials.json
+*_credentials.json
+*credentials*
+secrets/
+
+# Checkpoints and extraction caches
+checkpoint*.json
+.checkpoints/
+
+# Generated extraction outputs and usage logs
+output.json
+out.json
+*_out.json
+*_output.json
+*.output.json
+test_*.json
+geminiout.json
+outputs/
+usage*.jsonl
+
+# Temporary, log, and OS files
+*.tmp
+*.bak
+*.log
+*.log.*
+.DS_Store
+Thumbs.db
+
+# Python caches and virtual environments
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
